@@ -2,13 +2,17 @@ import base64
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import time
 
 import streamlit as st
 from google import genai
 
 from prompts import SYSTEM_PROMPT, SUMMARY_REQUEST_PROMPT, WELCOME_MESSAGE_TEMPLATE
 
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = [
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+]
 
 st.set_page_config(page_title="Snap & Study", page_icon="📚", layout="centered")
 
@@ -40,38 +44,65 @@ def add_message(role, kind, content):
 
 
 def ask_gemini(text, image_bytes=None, mime_type=None, update_history=True):
-    try:
-        if image_bytes is not None:
-            input_content = [
-                {"type": "text", "text": text},
-                {
-                    "type": "image",
-                    "data": base64.b64encode(image_bytes).decode("utf-8"),
-                    "mime_type": mime_type or "image/jpeg",
-                },
-            ]
-        else:
-            input_content = text
+    if image_bytes is not None:
+        input_content = [
+            {
+                "type": "text",
+                "text": text,
+            },
+            {
+                "type": "image",
+                "data": base64.b64encode(image_bytes).decode("utf-8"),
+                "mime_type": mime_type or "image/jpeg",
+            },
+        ]
+    else:
+        input_content = text
 
-        request_args = {
-            "model": MODEL_NAME,
-            "input": input_content,
-            "system_instruction": SYSTEM_PROMPT,
-        }
+    previous_id = st.session_state.get("last_interaction_id")
 
-        previous_id = st.session_state.get("last_interaction_id")
-        if previous_id:
-            request_args["previous_interaction_id"] = previous_id
+    last_error = None
 
-        interaction = gemini_client.interactions.create(**request_args)
+    for model_name in MODEL_NAME:
+        for attempt in range(3):
+            try:
+                request_args = {
+                    "model": model_name,
+                    "input": input_content,
+                    "system_instruction": SYSTEM_PROMPT,
+                }
 
-        if update_history:
-            st.session_state.last_interaction_id = interaction.id
+                if previous_id:
+                    request_args["previous_interaction_id"] = previous_id
 
-        return interaction.output_text or "I couldn't generate an explanation."
+                interaction = gemini_client.interactions.create(
+                    **request_args
+                )
 
-    except Exception as error:
-        return f"Sorry, I couldn't process that request: {error}"
+                if update_history:
+                    st.session_state.last_interaction_id = interaction.id
+
+                return interaction.output_text or (
+                    "I couldn't generate an explanation."
+                )
+
+            except Exception as error:
+                last_error = error
+                error_text = str(error)
+
+                # Retry temporary 503/429 errors.
+                if "503" in error_text or "429" in error_text:
+                    time.sleep(2 ** attempt)
+                    continue
+
+                # Other errors should not be hidden.
+                break
+
+    return (
+        "Gemini is temporarily unavailable. "
+        "Please try again in a moment.\n\n"
+        f"Technical detail: {last_error}"
+    )
 
 
 def build_summary():
