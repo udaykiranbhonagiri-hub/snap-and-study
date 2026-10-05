@@ -1,24 +1,16 @@
+import base64
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 import streamlit as st
 from google import genai
-from google.genai import types
 
-from prompts import (
-    SYSTEM_PROMPT,
-    SUMMARY_REQUEST_PROMPT,
-    WELCOME_MESSAGE_TEMPLATE,
-)
+from prompts import SYSTEM_PROMPT, SUMMARY_REQUEST_PROMPT, WELCOME_MESSAGE_TEMPLATE
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.8-flash"
 
-st.set_page_config(
-    page_title="Snap & Study",
-    page_icon="📚",
-    layout="centered",
-)
+st.set_page_config(page_title="Snap & Study", page_icon="📚", layout="centered")
 
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 GMAIL_ADDRESS = st.secrets["GMAIL_ADDRESS"]
@@ -47,12 +39,57 @@ def add_message(role, kind, content):
     )
 
 
-def ask_gemini(parts):
+def ask_gemini(text, image_bytes=None, mime_type=None, update_history=True):
     try:
-        response = st.session_state.chat.send_message(parts)
-        return response.text or "I couldn't generate an explanation for that."
+        if image_bytes is not None:
+            input_content = [
+                {"type": "text", "text": text},
+                {
+                    "type": "image",
+                    "data": base64.b64encode(image_bytes).decode("utf-8"),
+                    "mime_type": mime_type or "image/jpeg",
+                },
+            ]
+        else:
+            input_content = text
+
+        request_args = {
+            "model": MODEL_NAME,
+            "input": input_content,
+            "system_instruction": SYSTEM_PROMPT,
+        }
+
+        previous_id = st.session_state.get("last_interaction_id")
+        if previous_id:
+            request_args["previous_interaction_id"] = previous_id
+
+        interaction = gemini_client.interactions.create(**request_args)
+
+        if update_history:
+            st.session_state.last_interaction_id = interaction.id
+
+        return interaction.output_text or "I couldn't generate an explanation."
+
     except Exception as error:
         return f"Sorry, I couldn't process that request: {error}"
+
+
+def build_summary():
+    try:
+        previous_id = st.session_state.get("last_interaction_id")
+        if not previous_id:
+            return "No study conversation is available yet."
+
+        interaction = gemini_client.interactions.create(
+            model=MODEL_NAME,
+            input=SUMMARY_REQUEST_PROMPT,
+            previous_interaction_id=previous_id,
+            system_instruction=SYSTEM_PROMPT,
+        )
+        return interaction.output_text or "No summary was generated."
+
+    except Exception as error:
+        return f"Unable to create summary: {error}"
 
 
 def send_email(to_address, subject, body):
@@ -67,20 +104,13 @@ def send_email(to_address, subject, body):
         server.send_message(message)
 
 
-def build_summary():
-    return ask_gemini([SUMMARY_REQUEST_PROMPT])
-
-
-# ---------------------------
-# Onboarding
-# ---------------------------
 if "onboarded" not in st.session_state:
     st.title("📚 Snap & Study")
     st.caption("Take a picture. Understand it. Save the explanation.")
 
     st.info(
         "Upload a textbook problem, handwritten note, diagram, code question, "
-        "or any study material you want Gemini to explain."
+        "or study material you want Gemini to explain."
     )
 
     with st.form("onboarding_form"):
@@ -90,8 +120,7 @@ if "onboarded" not in st.session_state:
             placeholder="student@example.com",
         )
         submitted = st.form_submit_button(
-            "Start Learning 🚀",
-            use_container_width=True,
+            "Start Learning 🚀", use_container_width=True
         )
 
     if submitted:
@@ -102,24 +131,14 @@ if "onboarded" not in st.session_state:
         else:
             st.session_state.name = name.strip()
             st.session_state.email = email.strip()
-
-            st.session_state.chat = gemini_client.chats.create(
-                model=MODEL_NAME,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT
-                ),
-            )
-
             st.session_state.messages = []
+            st.session_state.last_interaction_id = None
             st.session_state.onboarded = True
             st.rerun()
 
     st.stop()
 
 
-# ---------------------------
-# Main app
-# ---------------------------
 header_col, button_col = st.columns([5, 2], vertical_alignment="center")
 
 with header_col:
@@ -127,13 +146,9 @@ with header_col:
     st.caption(f"Learning with {st.session_state.name}")
 
 with button_col:
-    send_disabled = len(st.session_state.messages) <= 1
+    send_disabled = st.session_state.get("last_interaction_id") is None
 
-    if st.button(
-        "📧 Email Summary",
-        disabled=send_disabled,
-        use_container_width=True,
-    ):
+    if st.button("📧 Email Summary", disabled=send_disabled, use_container_width=True):
         with st.spinner("Preparing your study summary..."):
             summary = build_summary()
 
@@ -146,7 +161,6 @@ with button_col:
             st.success("Summary sent to your email.")
         except Exception as error:
             st.error(f"Couldn't send the email: {error}")
-
 
 st.caption(f"Summaries will be sent to {st.session_state.email}")
 
@@ -170,30 +184,34 @@ user_input = st.chat_input(
 if user_input:
     photo = user_input.files[0] if user_input.files else None
     text = user_input.text.strip()
-    parts = []
+
+    if not text and photo is None:
+        st.warning("Enter a question or attach an image.")
+        st.stop()
+
+    photo_bytes = None
+    photo_mime = None
 
     if photo is not None:
         photo_bytes = photo.getvalue()
+        photo_mime = photo.type
         add_message("user", "image", photo_bytes)
-
-        parts.append(
-            types.Part.from_bytes(
-                data=photo_bytes,
-                mime_type=photo.type,
-            )
-        )
 
     if text:
         add_message("user", "text", text)
-        parts.append(text)
-    elif photo is not None:
-        parts.append(
-            "Analyze this study material and explain the important content "
-            "in simple language. If it contains a question, solve it step by step."
-        )
+
+    prompt = text or (
+        "Analyze this study material carefully. Explain what it contains "
+        "in simple language. If it contains a question, solve it step by step. "
+        "If it contains code, explain the logic and complexity."
+    )
 
     with st.spinner("Analyzing your study material..."):
-        answer = ask_gemini(parts)
+        answer = ask_gemini(
+            prompt,
+            image_bytes=photo_bytes,
+            mime_type=photo_mime,
+        )
 
     add_message("assistant", "text", answer)
     st.rerun()
